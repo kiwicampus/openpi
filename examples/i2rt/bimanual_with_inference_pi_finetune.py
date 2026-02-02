@@ -983,7 +983,7 @@ def main():
             check_all_can_interfaces()
         
         # Setup controller with inference using the new API
-        config_name = "pi05_i2rt_lora"
+        config_name = "pi0_i2rt_lora"
         checkpoint_dir = "/home/i2rt/openpi/checkpoints/pi05_i2rt_lora/pi_lora_train/20000"
         
         controller = BimanualTeleopWithInference(

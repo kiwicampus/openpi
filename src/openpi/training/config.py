@@ -801,9 +801,9 @@ _CONFIGS = [
         name="pi0_i2rt_lora",
         model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotI2RTDataConfig(
-            repo_id="/home/zetans/Downloads/pick_and_place_data/double_merged",
+            repo_id="act_pick_and_place/double_merged",
             base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
+            extra_delta_transform=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
@@ -824,7 +824,7 @@ _CONFIGS = [
         data=LeRobotI2RTDataConfig(
             repo_id="act_pick_and_place/double_merged",
             base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
+            extra_delta_transform=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
