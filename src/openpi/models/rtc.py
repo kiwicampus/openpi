@@ -36,7 +36,9 @@ from openpi.models import model as _model
 PrefixAttentionSchedule = Literal["zeros", "ones", "linear", "exp"]
 
 
-def get_prefix_weights(start: int, end: int, total: int, schedule: PrefixAttentionSchedule) -> jax.Array:
+def get_prefix_weights(
+    start: int | jax.Array, end: int | jax.Array, total: int, schedule: PrefixAttentionSchedule
+) -> jax.Array:
     """Soft prefix mask over the `total` timesteps of the chunk being generated.
 
     Verbatim port of PI's kinetix `get_prefix_weights`. With start=2, end=6, total=10:
@@ -53,6 +55,8 @@ def get_prefix_weights(start: int, end: int, total: int, schedule: PrefixAttenti
 
     `end` takes precedence over `start`: if ``end < start`` then `start` is pushed down to
     `end`, so ``end == 0`` ignores the prefix entirely.
+
+    `start` and `end` may be traced; only `total` and `schedule` must be concrete.
     """
     start = jnp.minimum(start, end)
     if schedule == "ones":
@@ -92,15 +96,19 @@ class RTCConfig:
     schedule=LINEAR, max_guidance_weight=10.0, execution_horizon=10.
     """
 
+    # Under `jax.jit`, `execution_horizon`, `inference_delay` and `max_guidance_weight` may be
+    # traced values and can change per call without triggering a recompile. The two that select
+    # which computation runs -- `prefix_attention_schedule` and `use_vjp` -- must stay concrete.
+    #
     # Soft-mask shape over the prefix.
     prefix_attention_schedule: PrefixAttentionSchedule = "exp"
     # Upper clamp on the guidance weight, which diverges as time -> 1 (pure noise).
     max_guidance_weight: float = 10.0
     # Timesteps of the chunk that overlap the previous chunk, i.e. `end` of the soft mask.
-    execution_horizon: int = 25
+    execution_horizon: int | jax.Array = 25
     # Timesteps already committed to the robot while this chunk is being computed, i.e.
     # `start` of the soft mask; these are pinned hard to the previous chunk.
-    inference_delay: int = 0
+    inference_delay: int | jax.Array = 0
     # True  -> PI's pinv correction, a real vector-Jacobian product through the denoiser.
     # False -> first-order form in which d(x_1)/d(x_t) is taken to be the identity, so the
     #          correction collapses to the weighted error itself. This is what LeRobot's
@@ -239,8 +247,11 @@ def sample_actions_rtc(
             prev = jnp.broadcast_to(prev, (batch_size, *prev.shape[1:]))
         prev_len = prev.shape[1]
         # A previous tail shorter than the requested execution horizon has nothing left to
-        # merge with beyond its own length, so clamp (matches LeRobot's behaviour).
-        end = min(config.execution_horizon, prev_len, model.action_horizon)
+        # merge with beyond its own length, so clamp (matches LeRobot's behaviour). Done with
+        # `jnp.minimum` rather than `min` so `execution_horizon` may be a traced value: in a
+        # real RTC loop the measured delay and horizon change every control cycle, and forcing
+        # them static would recompile the whole sampler on each new value.
+        end = jnp.minimum(jnp.minimum(jnp.asarray(config.execution_horizon), prev_len), model.action_horizon)
         pad = [(0, 0), (0, max(model.action_horizon - prev_len, 0)), (0, max(model.action_dim - prev.shape[2], 0))]
         prev = jnp.pad(prev[:, : model.action_horizon, : model.action_dim], pad)
         weights = get_prefix_weights(
