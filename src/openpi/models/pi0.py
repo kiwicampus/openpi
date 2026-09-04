@@ -277,3 +277,18 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_rtc(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        **kwargs,
+    ) -> _model.Actions:
+        """Sample an action chunk with Real-Time Chunking guidance.
+
+        Thin delegate to `openpi.models.rtc.sample_actions_rtc`; see it for the arguments.
+        `sample_actions` above is deliberately left untouched.
+        """
+        from openpi.models import rtc as _rtc
+
+        return _rtc.sample_actions_rtc(self, rng, observation, **kwargs)
