@@ -94,6 +94,10 @@ class RTCConfig:
     For orientation: PI's kinetix eval defaults to schedule="exp", max_guidance_weight=5.0,
     num_flow_steps=5, inference_delay=0, execute_horizon=1; LeRobot's RTCConfig defaults to
     schedule=LINEAR, max_guidance_weight=10.0, execution_horizon=10.
+
+    Note that LeRobot's `execution_horizon` default of 10 is a literal, and a literal is only
+    correct for one replan interval -- see the field comment below. This config defaults it to
+    `None` instead, which resolves to the full leftover and so tracks any replan interval.
     """
 
     # Under `jax.jit`, `execution_horizon`, `inference_delay` and `max_guidance_weight` may be
@@ -104,8 +108,21 @@ class RTCConfig:
     prefix_attention_schedule: PrefixAttentionSchedule = "exp"
     # Upper clamp on the guidance weight, which diverges as time -> 1 (pure noise).
     max_guidance_weight: float = 10.0
-    # Timesteps of the chunk that overlap the previous chunk, i.e. `end` of the soft mask.
-    execution_horizon: int | jax.Array = 25
+    # Where prefix influence decays to zero, i.e. `end` of the soft mask -- the number of
+    # timesteps of the new chunk that OVERLAP the previous one, which is not the replan
+    # interval. The identity to keep in mind is
+    #
+    #     execution_horizon == action_horizon - replan_interval == len(prev_chunk_left_over)
+    #
+    # and it is what PI calls `prefix_attention_horizon`; their eval computes it as
+    # `action_chunk_size - execute_horizon` (kinetix `src/eval_flow.py`). Passing the replan
+    # interval here instead narrows the attention window silently -- with a 50-step chunk
+    # replanned every 10, the prefix should be attended over 40 steps, not 10.
+    #
+    # `None` means "the whole leftover", which is the identity above and therefore PI's value
+    # for any replan interval. Prefer it to a literal; a fixed number is only ever right for
+    # one replan interval. Always clamped to the leftover's length and the action horizon.
+    execution_horizon: int | jax.Array | None = None
     # Timesteps already committed to the robot while this chunk is being computed, i.e.
     # `start` of the soft mask; these are pinned hard to the previous chunk.
     inference_delay: int | jax.Array = 0
@@ -217,7 +234,8 @@ def sample_actions_rtc(
         prev_chunk_left_over: [ah_prev, ad] or [b, ah_prev, ad] -- the previous chunk's
             unexecuted tail in *normalized* action space, aligned so that index 0 is the
             timestep this new chunk's index 0 will occupy. Shorter than the horizon is fine
-            (it is zero-padded, and the execution horizon is clamped to its length). `None`
+            (it is zero-padded, and the execution horizon is clamped to its length, and
+            defaults to exactly it). `None`
             disables guidance, in which case this reduces exactly to `sample_actions`.
         config: RTC knobs; `overrides` (e.g. `inference_delay=5`) are applied on top.
         num_steps: flow-matching steps, as in `sample_actions`.
@@ -251,7 +269,12 @@ def sample_actions_rtc(
         # `jnp.minimum` rather than `min` so `execution_horizon` may be a traced value: in a
         # real RTC loop the measured delay and horizon change every control cycle, and forcing
         # them static would recompile the whole sampler on each new value.
-        end = jnp.minimum(jnp.minimum(jnp.asarray(config.execution_horizon), prev_len), model.action_horizon)
+        if config.execution_horizon is None:
+            # The whole leftover, i.e. `action_horizon - replan_interval`, which is PI's
+            # `prefix_attention_horizon`. Both terms are shapes, so this stays static.
+            end = min(prev_len, model.action_horizon)
+        else:
+            end = jnp.minimum(jnp.minimum(jnp.asarray(config.execution_horizon), prev_len), model.action_horizon)
         pad = [(0, 0), (0, max(model.action_horizon - prev_len, 0)), (0, max(model.action_dim - prev.shape[2], 0))]
         prev = jnp.pad(prev[:, : model.action_horizon, : model.action_dim], pad)
         weights = get_prefix_weights(
