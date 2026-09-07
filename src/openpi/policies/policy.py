@@ -63,6 +63,8 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+        # Built lazily by `infer_rtc`, one compiled graph per (schedule, use_vjp).
+        self._rtc_samplers: dict[tuple[str, bool], Any] = {}
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -103,6 +105,110 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        return outputs
+
+    def _rtc_sampler(self, prefix_attention_schedule: str, use_vjp: bool):
+        """The jitted RTC sampler for one (schedule, use_vjp) pair, built once.
+
+        Those two select which computation runs rather than parameterizing it,
+        so they are static and each pair is its own compiled graph. Everything a
+        control loop varies per cycle -- delay, horizon, guidance ceiling, noise,
+        step count -- stays traced, so a running robot never recompiles.
+        """
+        key = (prefix_attention_schedule, use_vjp)
+        if key not in self._rtc_samplers:
+            self._rtc_samplers[key] = nnx_utils.module_jit(
+                self._model.sample_actions_rtc,
+                static_argnames=("prefix_attention_schedule", "use_vjp"),
+            )
+        return self._rtc_samplers[key]
+
+    def infer_rtc(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        prev_chunk_left_over: np.ndarray | None = None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
+        max_guidance_weight: float = 10.0,
+        prefix_attention_schedule: str = "exp",
+        use_vjp: bool = True,
+        num_steps: int | None = None,
+    ) -> dict:
+        """Infer with Real-Time Chunking guidance, returning the normalized chunk too.
+
+        `infer` above unnormalizes before returning, but RTC prefixes are in
+        normalized model space: a caller that fed back the unnormalized chunk
+        would guide in the wrong frame with no error anywhere. So both are
+        returned, and `actions` still means exactly what it means in `infer`.
+
+        `prev_chunk_left_over` of None takes the unguided `sample_actions` path,
+        which is a separate compiled graph and the cheaper one; guidance costs a
+        vector-Jacobian product through the denoiser at every step.
+
+        Args:
+            obs: Observation dict, as for `infer`.
+            noise: [ah, ad] or [b, ah, ad] initial noise, at the model's own
+                action dim; drawn from the policy rng when omitted.
+            prev_chunk_left_over: [ah, ad] previous chunk's unexecuted tail in
+                normalized action space, index 0 aligned with the new chunk's
+                index 0. None disables guidance.
+            inference_delay: Leading timesteps already committed to the robot.
+            execution_horizon: Where prefix influence decays to zero; clamped to
+                the tail's own length by the sampler.
+            max_guidance_weight: Guidance ceiling.
+            prefix_attention_schedule: Soft-mask shape, one of the
+                `rtc.PrefixAttentionSchedule` literals.
+            use_vjp: True for PI's pseudo-inverse correction, False for the
+                first-order form LeRobot's port computes.
+            num_steps: Flow-matching steps; the policy's own when omitted.
+
+        Returns:
+            The `infer` dict plus `normalized_actions`, the model-space chunk.
+        """
+        if self._is_pytorch_model:
+            raise NotImplementedError("infer_rtc is implemented for the JAX path only")
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        self._rng, sample_rng = jax.random.split(self._rng)
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if num_steps is not None:
+            sample_kwargs["num_steps"] = num_steps
+        if noise is not None:
+            noise = jnp.asarray(noise)
+            sample_kwargs["noise"] = noise[None, ...] if noise.ndim == 2 else noise
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        if prev_chunk_left_over is None:
+            chunk = self._sample_actions(sample_rng, observation, **sample_kwargs)
+        else:
+            prev = jnp.asarray(prev_chunk_left_over, dtype=jnp.float32)
+            chunk = self._rtc_sampler(prefix_attention_schedule, use_vjp)(
+                sample_rng,
+                observation,
+                prev_chunk_left_over=prev[None, ...] if prev.ndim == 2 else prev,
+                inference_delay=inference_delay,
+                execution_horizon=(
+                    prev.shape[-2] if execution_horizon is None else execution_horizon
+                ),
+                max_guidance_weight=max_guidance_weight,
+                prefix_attention_schedule=prefix_attention_schedule,
+                use_vjp=use_vjp,
+                **sample_kwargs,
+            )
+        model_time = time.monotonic() - start_time
+
+        normalized = np.asarray(chunk[0, ...])
+        outputs = self._output_transform(
+            {"state": np.asarray(inputs["state"][0, ...]), "actions": normalized.copy()}
+        )
+        outputs["normalized_actions"] = normalized
+        outputs["policy_timing"] = {"infer_ms": model_time * 1000}
         return outputs
 
     @property
